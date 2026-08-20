@@ -170,7 +170,19 @@ All seeds are fixed (`--seed`, default 42) and cudnn is set deterministic in
 `apply_fabric` have no randomness at all.
 
 ---
+## Results (validation set)
 
+Trained on the Fashionpedia validation split (631 train / 111 val images) due to
+the 24h window. Best mean IoU over the 4 training classes: 0.572.
+
+Honest reading of that number:
+- It includes the background class, which is easy and lifts the average. Per-panel
+  IoU on body/sleeve/collar is lower; body is strongest, collar (small and thin)
+  is weakest.
+- Training on the full train2020 set (~45k images) instead of the val split would
+  be the biggest quality lever and is the first thing I'd do with more time.
+
+---
 ## How to reproduce training
 
 ```bash
