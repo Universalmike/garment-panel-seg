@@ -1,0 +1,46 @@
+name: tests
+
+# Proof that the repo does what the README says without anyone having to email
+# the author: clone, install, check the parameter cap, run the tests, and run
+# both worked examples end to end against the committed checkpoint.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU-only torch
+        # The default wheels pull in CUDA and are ~2GB; inference here is CPU-only
+        # anyway, per the brief.
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install remaining dependencies
+        run: pip install -r requirements.txt
+
+      - name: Trainable parameters stay under the 2M cap
+        run: |
+          python -c "from src.model import PanelSegNet, count_params; tr, tot = count_params(PanelSegNet(pretrained=False)); print('trainable', tr, '| total', tot); assert tr < 2_000_000, 'over the 2M trainable cap'"
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Worked example for apply_fabric
+        run: python example_apply_fabric.py
+
+      - name: predict.py runs against the committed weights
+        run: python predict.py --image example_after.png --out /tmp/mask.png
+
+      - name: Absent panel exits cleanly rather than raising
+        run: python predict.py --image example_after.png --out /tmp/back.png --panel back_body

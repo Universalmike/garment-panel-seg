@@ -87,8 +87,9 @@ class PanelSegNet(nn.Module):
                 p.requires_grad = False
         self._encoder_frozen = freeze_encoder
 
-        # Decoder channel widths. Tuned to use most of the trainable budget
-        # (roughly 1.4M params) while staying safely under the 2M cap.
+        # Decoder channel widths. Depthwise-separable convs keep this cheap:
+        # the decoder is 491,564 trainable params, well under the 2M cap.
+        # Run `python src/model.py` to re-derive the exact count.
         c4, c3, c2, c1, c0 = 256, 192, 128, 96, 64
         self.up4 = UpBlock(320, 96, c4)   # 1/32 -> 1/16
         self.up3 = UpBlock(c4, 32, c3)    # 1/16 -> 1/8

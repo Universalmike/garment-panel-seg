@@ -8,6 +8,12 @@ Augmentation is deliberately conservative and geometry-aware:
     downstream is confused by it.
   - Colour jitter helps a little with the photo->render domain gap, but we keep
     it mild so we do not destroy fabric cues the model may rely on.
+
+Randomness: each DataLoader worker gets its own RNG, seeded from the dataset
+seed plus its worker id. Seeding the global `random` module once at construction
+would hand every worker the identical stream, so with num_workers=2 half the
+augmentation would be a duplicate of the other half. This keeps the run
+reproducible for a fixed seed and worker count, without that collision.
 """
 
 import json
@@ -25,21 +31,31 @@ class GarmentDataset(Dataset):
             self.items = json.load(f)
         self.size = size
         self.train = train
-        random.seed(seed)
+        self.seed = seed
+        self._rng = None  # created lazily, once per worker process
 
     def __len__(self):
         return len(self.items)
 
+    def _worker_rng(self):
+        """An RNG private to this worker process, deterministic for a given seed."""
+        if self._rng is None:
+            info = torch.utils.data.get_worker_info()
+            worker_id = info.id if info is not None else 0
+            self._rng = random.Random(self.seed + worker_id)
+        return self._rng
+
     def _augment(self, img, mask):
+        rng = self._worker_rng()
         # horizontal flip
-        if random.random() < 0.5:
+        if rng.random() < 0.5:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
         # mild colour jitter on the image only
-        if random.random() < 0.5:
+        if rng.random() < 0.5:
             from PIL import ImageEnhance
-            img = ImageEnhance.Brightness(img).enhance(random.uniform(0.85, 1.15))
-            img = ImageEnhance.Color(img).enhance(random.uniform(0.85, 1.15))
+            img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.85, 1.15))
+            img = ImageEnhance.Color(img).enhance(rng.uniform(0.85, 1.15))
         return img, mask
 
     def __getitem__(self, i):

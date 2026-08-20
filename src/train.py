@@ -8,8 +8,11 @@ Loss: class-weighted cross-entropy + Dice. Collar and sleeve are small relative
 to body and background, so we up-weight them; Dice further helps the thin/small
 classes.
 
-Metric: mean per-class IoU (the same definition the graders use), computed over
-the classes present in each image and averaged.
+Metric: the brief's own definition - per-class IoU over the classes present in
+each IMAGE, averaged, then averaged over images, with background excluded. See
+src/metrics.py for why those two details matter. Model selection uses the
+panels-only number, so we do not pick a checkpoint that merely got good at
+predicting background.
 
 Usage:
     python -m src.train --manifest data/train/manifest.json \
@@ -28,7 +31,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from .dataset import GarmentDataset
-from .model import PanelSegNet, NUM_TRAIN_CLASSES, count_params
+from .metrics import IoUAccumulator
+from .model import PanelSegNet, TRAIN_CLASSES, NUM_TRAIN_CLASSES, count_params
 
 
 def set_seed(seed):
@@ -48,22 +52,6 @@ def dice_loss(logits, target, num_classes, eps=1.0):
     union = probs.sum(dims) + onehot.sum(dims)
     dice = (2 * inter + eps) / (union + eps)
     return 1 - dice.mean()
-
-
-@torch.no_grad()
-def mean_iou(logits, target, num_classes):
-    """Mean per-class IoU over classes present in the batch's ground truth."""
-    pred = logits.argmax(1)
-    ious = []
-    for c in range(num_classes):
-        p, t = pred == c, target == c
-        if not t.any() and not p.any():
-            continue
-        inter = (p & t).sum().item()
-        union = (p | t).sum().item()
-        if union > 0:
-            ious.append(inter / union)
-    return float(np.mean(ious)) if ious else 0.0
 
 
 def main():
@@ -108,6 +96,7 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     best = -1.0
+    best_report = None
     for ep in range(args.epochs):
         model.train()
         run = 0.0
@@ -122,26 +111,35 @@ def main():
         sched.step()
 
         model.eval()
-        mious = []
+        acc = IoUAccumulator(NUM_TRAIN_CLASSES, TRAIN_CLASSES)
         with torch.no_grad():
             for img, mask in val_loader:
-                img, mask = img.to(device), mask.to(device)
-                mious.append(mean_iou(model(img), mask, NUM_TRAIN_CLASSES))
-        vmiou = float(np.mean(mious)) if mious else 0.0
-        print(f"epoch {ep+1:02d}/{args.epochs}  loss {run/max(1,len(train_loader)):.4f}  val_mIoU {vmiou:.4f}")
+                pred = model(img.to(device)).argmax(1)
+                acc.update(pred, mask)
+        vmiou = acc.miou()                          # panels only: the brief's metric
+        vmiou_bg = acc.miou(include_background=True)
+        avg_loss = run / max(1, len(train_loader))
+        print(f"epoch {ep+1:02d}/{args.epochs}  loss {avg_loss:.4f}  "
+              f"val_mIoU(panels) {vmiou:.4f}  val_mIoU(incl bg) {vmiou_bg:.4f}")
 
         if vmiou > best:
             best = vmiou
+            best_report = acc.report()
             os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
             # Save the FULL state dict (encoder + decoder) so predict.py needs no
             # download at inference time.
             torch.save({"state_dict": model.state_dict(),
                         "val_miou": vmiou,
+                        "val_miou_with_background": vmiou_bg,
+                        "per_class_iou": {k: v[0] for k, v in acc.per_class().items()},
                         "size": args.size,
                         "seed": args.seed}, args.out)
             print(f"  saved {args.out} (val_mIoU {vmiou:.4f})")
 
-    print(f"best val_mIoU {best:.4f}")
+    print(f"best val_mIoU (panels only) {best:.4f}")
+    if best_report:
+        print()
+        print(best_report)
 
 
 if __name__ == "__main__":
