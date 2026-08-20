@@ -60,9 +60,9 @@ python predict.py --image tank_top.jpg --out mask.png --panel left_sleeve
 python predict.py --image tank_top.jpg --out mask.png --panel "Left Sleeve"   # same thing
 ```
 
-**Optional flip TTA** (off by default — see below):
+**Flip TTA is on by default**; disable it to halve latency:
 ```bash
-python predict.py --image shirt.jpg --out mask.png --tta
+python predict.py --image shirt.jpg --out mask.png --no-tta
 ```
 
 Two things `predict.py` does that are worth knowing:
@@ -71,13 +71,13 @@ Two things `predict.py` does that are worth knowing:
   after. Taking `argmax` at 256×256 and then resizing the class map with
   nearest-neighbour quantises every boundary to an 8-pixel block on a 2048px
   image. Boundaries are most of the IoU on thin classes.
-- **Horizontal-flip TTA is implemented and tested, but off by default.** It is
-  only *possible* because the network is left/right agnostic — a model emitting
-  `left_sleeve`/`right_sleeve` directly could not average a mirrored pass at all.
-  It is off because we have not yet measured it on held-out data, and shipping an
-  unmeasured accuracy change as the default is how you lose points you thought
-  you were gaining. `python -m src.evaluate --compare` decides it; if TTA wins,
-  flip `USE_TTA_BY_DEFAULT` in `predict.py`.
+- **Horizontal-flip TTA is on, and was measured before being switched on.** It
+  is only *possible* because the network is left/right agnostic — a model
+  emitting `left_sleeve`/`right_sleeve` directly could not average a mirrored
+  pass at all. On the held-out split it buys +0.014 mean IoU (body +0.014, sleeve
+  +0.018, collar −0.006) for one extra forward pass. It was very nearly shipped
+  disabled on the strength of a synthetic probe that said it hurt; the probe was
+  not representative, and the held-out measurement overruled it.
 
 **Fill a panel with fabric** (Part 2). Importable function, with a runnable
 example:
@@ -288,6 +288,12 @@ that needs render samples we do not have. Their held-out set is the real test.
 `--synth-frac` is a starting point at 0.5 (~1000 synthetic against 631 real), not
 a swept value.
 
+**Measured outcome:** 631 real + 1000 synthetic beat the Fashionpedia-only
+baseline on real photographs by **+0.027 mean IoU** (0.533 → 0.560), with body
++0.025 and sleeve +0.041. Collar went the other way, −0.017 — see *Results* for
+why that is probably the generator's collar geometry rather than the idea being
+wrong.
+
 The `Synthetic renders` section of `garmentimage-training.ipynb` runs the whole
 thing on Kaggle: generate, *look at a contact sheet before training on it*, train
 mixed, then score baseline and mixed against the same real held-out split.
@@ -328,12 +334,22 @@ this repo measured during training in two ways that both matter:
 | averaging | over the whole **batch** | per **image**, then across images |
 | background | included | **excluded** - it is not a panel |
 
-Both differences inflate the number. Batch aggregation lets one large image
-swamp a small one and dilutes small-class errors, since with `batch=16` nearly
-every class appears somewhere in the batch. And background IoU is routinely
-above 0.9, so averaging it in rewards a model for finding nothing - which the
-brief explicitly says it does not want. `tests/test_metrics.py` has a worked
-case where the two definitions differ by an order of magnitude.
+They do not both push the same way, and the measured numbers make that concrete:
+
+- **Background inclusion inflates, heavily.** Background IoU is 0.963, so folding
+  it in lifts the mean from 0.519 to 0.655. That is the "reward a model for
+  finding nothing" failure the brief says it avoids, and it is the larger of the
+  two effects by far.
+- **Per-image averaging actually *raises* the number here**, from the old
+  batch-aggregated 0.572 to 0.655 like-for-like. That is not a general rule: it
+  happens because collar, the weakest class at 0.16, appears in only 30 of 111
+  images. Averaging per image lets it drag down those 30; batch aggregation
+  folded it into every batch. Reverse that rarity and the effect reverses too.
+
+The net is that the honest figure is lower — 0.533 against the 0.572 in the
+training log — but the mechanism is background, not the averaging.
+`tests/test_metrics.py` pins both behaviours, including a case where the two
+definitions differ by an order of magnitude.
 
 ---
 ## Results (validation set)
@@ -342,25 +358,59 @@ Trained on the Fashionpedia val2020 split (631 train / 111 val images) for 30
 epochs at 256×256, seed 42. The full training log is in
 `garmentimage-training.ipynb`.
 
-**0.572** is the number that run reported — but it was computed with the *old*
-metric: aggregated over batches, and with background included. Both of those
-flatter the model, so treat 0.572 as an upper bound rather than the score.
-`src/evaluate.py` reports the brief's actual definition (per-image, panels only)
-for the shipped checkpoint. Run it to get the honest per-panel figures; the
-training log's number is left here unedited so the two are comparable.
+Scored with `src/evaluate.py`, which implements the brief's metric literally
+(per image, over the panels present in that image's ground truth, background
+excluded) and runs the deployed inference path against full-resolution masks.
+All figures below are on the same 111 held-out Fashionpedia images, with flip
+TTA on.
 
-Honest reading of that number:
-- It includes the background class, which is easy and lifts the average. Per-panel
-  IoU on body/sleeve/collar is lower; body is strongest, collar (small and thin)
-  is weakest.
-- Training on the full train2020 set (~45k images) instead of the val split would
-  be the biggest quality lever and is the first thing I'd do with more time.
+**The shipped model is the mixed one. Its headline number is 0.560.**
+
+| class | baseline (Fashionpedia only) | **shipped (+ synthetic)** | Δ | images with it |
+|---|---|---|---|---|
+| background | 0.9634 | 0.9663 | +0.003 | 111 |
+| body | 0.6134 | **0.6385** | +0.025 | 111 |
+| sleeve | 0.5304 | **0.5710** | +0.041 | 111 |
+| collar | 0.1606 | 0.1432 | **−0.017** | 30 |
+| **mean, panels only (the brief's metric)** | 0.5330 | **0.5600** | **+0.027** | |
+| mean, including background | 0.6648 | 0.6842 | +0.019 | |
+
+Honest reading:
+
+- **Synthetic data paid off on the domain we can measure.** +0.027 mean IoU, 5%
+  relative, on real photographs — not merely "no worse", which is what we
+  budgeted for. The point of the synthetic set was render coverage we cannot
+  measure; improving photographs too was a bonus, and suggests it is supplying a
+  useful shape prior rather than just render styling.
+
+- **Collar got worse, and that is the interesting result.** It is the one panel
+  where the generator's geometry is a crude approximation — a plain elliptical
+  band, in ~74% of synthetic samples, where real collars have points, stands and
+  lapels. The two panels whose synthetic geometry is faithful (torso, tapered
+  tube) gained substantially; the one that is faked regressed. Read that as
+  evidence that **transfer tracks per-class fidelity**, and as the clearest
+  instruction for where to spend the next hour on the generator. Caveat: collar
+  is scored on 30 images, so −0.017 may be noise; the mechanism is a hypothesis,
+  not an established fact.
+
+- **Collar is weak in absolute terms either way (0.14–0.16).** Thin, small, and
+  boundary error dominates its IoU, which is where a 492k-parameter decoder
+  struggles most. This is the model's clearest weakness.
+
+- **Background at 0.966 is why it must be excluded.** Folding it in lifts the mean
+  by 0.12 for free — the "reward a model for finding nothing" failure the brief
+  explicitly says it avoids.
+
+- Training on the full train2020 set (~45k images) rather than the val split
+  remains the biggest untried lever.
 
 ---
 ## How to reproduce training
 
-These are the exact commands behind the numbers reported above. The full run,
-with output, is preserved in `garmentimage-training.ipynb` (Kaggle, one T4).
+These are the exact commands behind the numbers reported above. Both runs, with
+output, are preserved in `garmentimage-training.ipynb` (Kaggle, one T4): the
+Fashionpedia-only baseline and the mixed run that produced the shipped
+checkpoint. Drop step 3 and the `--synth-*` flags to reproduce the baseline.
 
 ```bash
 # 1. get Fashionpedia val2020 from the official CVDF mirror.
@@ -380,10 +430,19 @@ python -m src.prepare_data \
     --out  data/train \
     --max-images 4000 --require-sleeve --seed 42
 
-# 3. train -> best checkpoint to weights/model.pt (631 train / 111 val)
+# 3. generate synthetic garment renders (~5 min)
+python -m src.synth --out data/synth --n 2000 --size 384 --seed 42
+
+# 4. train on real + synthetic -> best checkpoint to weights/model.pt.
+#    631 real + 1000 synthetic for training; the 111 val images stay real only.
 python -m src.train --manifest data/train/manifest.json \
+    --synth-manifest data/synth/manifest.json --synth-frac 0.5 \
     --epochs 30 --size 256 --batch 16 --seed 42 \
     --out weights/model.pt
+
+# 5. score it the way the brief scores it
+python -m src.evaluate --manifest data/train/manifest.json \
+    --val-split 0.15 --seed 42
 ```
 
 To train on the full set instead, swap in `instances_attributes_train2020.json`
@@ -405,29 +464,41 @@ of 9 runs after warm-up. The network input is always 256×256; the output
 resolution varies because the logits are upsampled to the image's native size
 before argmax, and that upsample is not free:
 
-| output resolution | TTA off (default) | TTA on |
+| output resolution | TTA on (default) | TTA off (`--no-tta`) |
 |---|---|---|
-| 256 × 256 | **368 ms** | 848 ms |
-| 512 × 512 | **482 ms** | 862 ms |
-| 1024 × 1365 (typical photo) | **754 ms** | 1190 ms |
-| 2048 × 2048 | **1756 ms** | 2006 ms |
+| 256 × 256 | **848 ms** | 368 ms |
+| 512 × 512 | **862 ms** | 482 ms |
+| 1024 × 1365 (typical photo) | **1190 ms** | 754 ms |
+| 2048 × 2048 | **2006 ms** | 1756 ms |
 
 For reference, the Kaggle CPU used during training measured 373 ms/image at
 512×512 output under the older nearest-neighbour path.
 
-Upsampling logits rather than the class map costs roughly 250 ms at photo
-resolution. That buys sub-block boundary accuracy, which is where IoU is won or
-lost on thin classes like collar, so it is a trade worth making — but it is a
-real trade and it is stated rather than hidden.
+Two deliberate trades sit in those numbers: upsampling logits rather than the
+class map costs roughly 250 ms at photo resolution, and flip TTA roughly doubles
+the forward pass. Both buy accuracy that was measured rather than assumed
+(+0.014 mean IoU for TTA; boundary quality for the upsample, which is where IoU
+is won on thin classes). The brief sets no latency threshold, only asks that it
+be reported — so the accuracy is worth the milliseconds, and `--no-tta` is there
+if it is not.
 
 ---
 
 ## What I'd do next with two more days
 
-- **Sweep the synthetic mix, and raise its fidelity.** `--synth-frac 0.5` is a
-  guess, not a tuned value. The generator's remaining weak points are the collar
-  (a simple band, where a real one has a fold and a stand) and the silhouette
-  (geometrically clean, where real drape gives wavy hems and bunching).
+- **Fix the synthetic collar, which the numbers single out.** Body and sleeve
+  gained from synthetic data; collar lost. The generator draws a collar as a
+  plain elliptical band, and real collars have points, stands and lapels. Two
+  attacks, cheapest first: (a) mark synthetic collar pixels as `ignore_index` in
+  the loss, so synthetic data teaches body and sleeve but is not allowed to
+  express an opinion about collars — this should capture the gains without the
+  regression; (b) model the collar properly, with a stand and a fold. I would try
+  (a) first because it is a one-line loss change and tests the hypothesis
+  directly.
+
+- **Sweep the synthetic mix.** `--synth-frac 0.5` is a guess, not a tuned value,
+  and it produced +0.027 on the first attempt. The silhouette is also still
+  geometrically clean where real drape gives wavy hems and bunching.
 
 - **Back views, to unlock `back_body`.** The generator is the only realistic route
   to it — Fashionpedia has no front/back label and photographs of worn garments
@@ -472,14 +543,21 @@ real trade and it is stated rather than hidden.
   almost nothing on render-style inputs, not merely produce softer masks. That is
   the largest known risk in this submission and it is measured, not guessed at.
 
-- **The headline 0.572 is measured with the wrong metric.** It aggregates over
-  batches and counts background as a panel; both inflate it. `src/evaluate.py`
-  computes the brief's definition, and the honest per-panel numbers will be
-  lower. The old figure is left in place rather than quietly restated.
+- **The 0.572 in the original training log is not the score.** That was the old
+  batch-aggregated, background-inclusive metric, on the earlier
+  Fashionpedia-only model. Under the brief's definition the shipped model scores
+  **0.560**. Old figures are left in the notebook log rather than quietly
+  restated, and the gap between the metrics is explained in "Evaluating a
+  checkpoint".
 
-- **Flip TTA is unmeasured**, so it ships disabled. On the synthetic probe above
-  it made things worse — averaging two near-empty disagreeing predictions lands
-  on empty — but that probe is not representative enough to conclude from.
+- **Collar is the weak class: IoU 0.14.** Thin enough that boundary error
+  dominates, and present in only 30 of the 111 held-out images, so the figure is
+  noisy as well as poor. It also *regressed* when synthetic data was added
+  (0.161 → 0.143) while body and sleeve improved — the generator's collar is a
+  plain band and probably teaches the wrong shape. Shipped anyway because the
+  mean is up 0.027 and collar is weak in both models, but it is a known,
+  understood, and fixable regression rather than a mystery. See "what I'd do
+  next".
 
 ---
 

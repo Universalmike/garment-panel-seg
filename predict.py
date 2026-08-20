@@ -15,8 +15,9 @@ Two inference details worth knowing about:
     visibly stepped edges - which costs IoU exactly where thin classes like
     collar live.
 
-  - Horizontal-flip test-time augmentation is available (--tta), and is OFF by
-    default. See USE_TTA_BY_DEFAULT below for why it is off and how to decide.
+  - Horizontal-flip test-time augmentation is ON by default (--no-tta disables
+    it). It was measured on the held-out split before being turned on; see
+    USE_TTA_BY_DEFAULT below.
 
     It is worth knowing that TTA is only *possible* here because the network is
     deliberately left/right agnostic: it predicts a single generic "sleeve"
@@ -53,23 +54,28 @@ _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # ---- TTA DEFAULT -----------------------------------------------------------
-# Horizontal-flip TTA usually buys a little accuracy on in-distribution data,
-# and it is implemented and tested here. It is OFF by default anyway, because we
-# have not measured it on held-out data and shipping an unmeasured accuracy
-# change as the default is how you lose points you thought you were gaining.
+# ON, because it was measured rather than assumed. On the 111-image held-out
+# split (python -m src.evaluate --compare):
 #
-# To decide it properly, run:
-#     python -m src.evaluate --manifest data/train/manifest.json --compare
-# which reports per-class IoU with TTA on and off over the val split. If TTA
-# wins, flip this to True - that is the only change needed, and predict.py picks
-# it up.
+#                        TTA off    TTA on
+#     body                0.5993    0.6134
+#     sleeve              0.5125    0.5304
+#     collar              0.1669    0.1606
+#     mIoU (panels only)  0.5188    0.5330
 #
-# One observation that argues for measuring rather than assuming: averaging two
-# passes helps when both are roughly right and independently noisy. On an image
-# the model finds nothing in - which is what happens on out-of-distribution
-# render-style inputs, where it predicts background with ~0.99 confidence -
-# averaging two disagreeing near-empty predictions produces an even emptier one.
-USE_TTA_BY_DEFAULT = False
+# It costs one extra forward pass, roughly doubling latency, and buys +0.014
+# mean IoU - carried by body and sleeve, very slightly negative on collar. The
+# brief sets no latency threshold, only asks that we report it, so the accuracy
+# is worth the milliseconds.
+#
+# Worth recording that this was nearly shipped the other way. A probe on crude
+# synthetic renders had TTA making things much worse, on the reasoning that
+# averaging two disagreeing near-empty predictions lands on empty. That probe was
+# simply not representative of the real distribution. The lesson is the obvious
+# one: measure on held-out data, not on whatever is convenient to generate.
+#
+# Set to False (or pass --no-tta) to halve latency at a small accuracy cost.
+USE_TTA_BY_DEFAULT = True
 
 
 def load_model(weights_path, device="cpu"):
