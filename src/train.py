@@ -14,6 +14,14 @@ src/metrics.py for why those two details matter. Model selection uses the
 panels-only number, so we do not pick a checkpoint that merely got good at
 predicting background.
 
+Mixing in synthetic data: --synth-manifest adds procedurally generated garment
+renders (see src/synth.py) to the TRAINING set only. Validation stays purely real
+Fashionpedia, deliberately - synthetic images are far easier than photographs, so
+letting them into the val split would inflate the number and make it
+incomparable to the previous run. The question worth answering is whether adding
+render-style data costs us anything on real photos, and that needs the val set
+held fixed.
+
 Usage:
     python -m src.train --manifest data/train/manifest.json \
         --val-split 0.15 --epochs 25 --size 256 --batch 16 --seed 42
@@ -28,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from .dataset import GarmentDataset
 from .metrics import IoUAccumulator
@@ -56,7 +64,12 @@ def dice_loss(logits, target, num_classes, eps=1.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--manifest", required=True,
+                    help="real data; this is what gets split into train and val")
+    ap.add_argument("--synth-manifest", default=None,
+                    help="optional extra manifest (src.synth output), added to TRAINING only")
+    ap.add_argument("--synth-frac", type=float, default=1.0,
+                    help="fraction of the synthetic manifest to use, 0-1")
     ap.add_argument("--val-split", type=float, default=0.15)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--size", type=int, default=256)
@@ -78,11 +91,29 @@ def main():
     val_idx, train_idx = idx[:n_val], idx[n_val:]
 
     val_ds = GarmentDataset(args.manifest, size=args.size, train=False, seed=args.seed)
-    train_loader = DataLoader(Subset(full, train_idx), batch_size=args.batch,
+
+    train_parts = [Subset(full, train_idx)]
+    n_synth = 0
+    if args.synth_manifest:
+        synth = GarmentDataset(args.synth_manifest, size=args.size, train=True, seed=args.seed)
+        keep = list(range(len(synth)))
+        random.Random(args.seed + 1).shuffle(keep)
+        keep = keep[: int(len(keep) * max(0.0, min(1.0, args.synth_frac)))]
+        train_parts.append(Subset(synth, keep))
+        n_synth = len(keep)
+
+    train_set = train_parts[0] if len(train_parts) == 1 else ConcatDataset(train_parts)
+    train_loader = DataLoader(train_set, batch_size=args.batch,
                               shuffle=True, num_workers=2, drop_last=True)
     val_loader = DataLoader(Subset(val_ds, val_idx), batch_size=args.batch,
                             shuffle=False, num_workers=2)
-    print(f"train {len(train_idx)}  val {len(val_idx)}")
+
+    if n_synth:
+        share = n_synth / (len(train_idx) + n_synth)
+        print(f"train {len(train_idx)} real + {n_synth} synthetic "
+              f"({share:.0%} synthetic)  |  val {len(val_idx)} real only")
+    else:
+        print(f"train {len(train_idx)}  val {len(val_idx)}")
 
     model = PanelSegNet(pretrained=True, freeze_encoder=True).to(device)
     tr, tot = count_params(model)

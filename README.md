@@ -98,7 +98,7 @@ Image.fromarray(out).save("filled.png")
 
 **Run the tests:**
 ```bash
-pytest -q          # 19 tests across three suites
+pytest -q          # 27 tests across four suites
 ```
 
 - `tests/test_fabric.py` - targeting, determinism, absent panels, occlusion,
@@ -108,6 +108,9 @@ pytest -q          # 19 tests across three suites
 - `tests/test_inference.py` - the inference path, using stub networks so it needs
   no checkpoint. Includes a flip-equivariant network for which TTA must be a
   no-op, which is what catches a wrong un-flip.
+- `tests/test_synth.py` - the synthetic generator: determinism, valid label ids,
+  masks that agree with their images, sleeves that stay attached, and that
+  sleeveless and collarless garments keep being produced.
 
 CI runs all of this on every push (`.github/workflows/tests.yml`), plus the
 parameter-cap assertion and both worked examples, against the committed
@@ -216,15 +219,78 @@ geometry-based left/right logic transfers cleanly, while the learned masks will
 need render-style data or light fine-tuning to be production-grade. Mild colour
 jitter in training is the only nod to robustness here.
 
-**A probe, and it is not encouraging.** We ran the trained model over a handful
-of quickly-generated flat-shaded garment images — solid panels, plain
-background, a simple lighting ramp. The model predicted background across
-essentially the whole garment, at ~0.99 mean confidence, scoring near zero on
-every panel. That is *not* a measurement of the production render style: these
-were crude synthetic shapes, far simpler than a real 3D render, and simplicity
-can be as out-of-distribution as complexity. But it points at the gap being a
-step change rather than a gentle softening of the masks, and it is the first
-thing we would check with real render samples in hand. See "what I'd do next".
+**A probe, and it was not encouraging.** We ran the trained model over
+quickly-generated flat-shaded garment images — solid panels, plain background, a
+simple lighting ramp. It predicted background across essentially the whole
+garment at ~0.99 mean confidence, scoring near zero on every panel. That is not a
+measurement of the production render style (those shapes were far cruder than a
+real 3D render, and simplicity is as out-of-distribution as complexity), but it
+pointed at a step change rather than a gentle softening of the masks.
+
+So we did something about it — see the next section.
+
+---
+
+## Synthetic renders (`src/synth.py`)
+
+The brief permits synthetic data we generate ourselves, and a renderer is exactly
+the thing you can approximate cheaply when you know what the target domain looks
+like. `src/synth.py` procedurally draws garments with pixel-exact labels:
+
+![synthetic garment renders and their masks](example_synth.png)
+
+```bash
+python -m src.synth --out data/synth --n 2000 --seed 42 --contact-sheet sheet.png
+```
+
+Each sample gets directional lighting, two octaves of fold shading from smoothed
+noise, per-panel ambient occlusion so seams and silhouette edges darken, woven
+texture at pixel scale, a soft contact shadow, and varied colourways,
+proportions, sleeve length and droop, and framing. Geometry variation is applied
+to the polygons rather than by resampling the raster, so the labels stay exact.
+
+It is procedural drawing plus a shading model — no diffusion, no hosted image
+model, nothing the brief rules out.
+
+**Why it looks like this and not like coloured rectangles.** Flat polygons would
+teach the network flat polygons, which is a different out-of-distribution problem
+rather than a solution. Two specific things were wrong in the first version and
+had to be fixed after looking at the output: the neck opening was cut through to
+the backdrop, so every garment read as a bright donut, when what you actually see
+through a neck hole on an invisible form is the shadowed inside of the garment;
+and sleeves floated detached from the shoulder whenever droop and body taper
+pulled them apart, which would have taught the model that sleeves are free-flying
+rectangles. Both are fixed and both are pinned by tests.
+
+**Deliberate distribution choices.** About 18% of samples are sleeveless and 26%
+collarless, because the brief says its held-out set contains a garment where a
+requested panel is genuinely absent. Without those, the model never sees a
+garment that legitimately has no sleeve.
+
+### Training on it
+
+Synthetic data goes into the **training set only**:
+
+```bash
+python -m src.train --manifest data/train/manifest.json \
+    --synth-manifest data/synth/manifest.json --synth-frac 0.5 \
+    --epochs 30 --size 256 --batch 16 --seed 42
+```
+
+Validation stays pure Fashionpedia, on purpose. Synthetic images are far easier
+than photographs, so letting them into the val split would inflate the number and
+make it incomparable to the previous run. The question that split can answer is
+*did adding render-style data cost us anything on real photos*, and answering it
+needs the val set held fixed.
+
+The question it cannot answer is whether the model got better on actual renders —
+that needs render samples we do not have. Their held-out set is the real test.
+`--synth-frac` is a starting point at 0.5 (~1000 synthetic against 631 real), not
+a swept value.
+
+The `Synthetic renders` section of `garmentimage-training.ipynb` runs the whole
+thing on Kaggle: generate, *look at a contact sheet before training on it*, train
+mixed, then score baseline and mixed against the same real held-out split.
 
 ---
 
@@ -358,18 +424,19 @@ real trade and it is stated rather than hidden.
 
 ## What I'd do next with two more days
 
-- **Render-style training data, generated rather than collected.** The brief
-  permits synthetic data, and procedurally drawing garment templates — front
-  *and* back, random colourways, subtle shading ramps, random scale and rotation
-  — yields pixel-perfect labels for all five panels essentially for free. It is
-  procedural drawing, not a generative model, so it stays inside the constraint.
-  This is the single biggest lever available: it attacks the domain gap, and it
-  is the only route to `back_body` that does not require someone to hand-label
-  back views. Mixed 50/50 with Fashionpedia, this is what I would spend the next
-  day on.
+- **Sweep the synthetic mix, and raise its fidelity.** `--synth-frac 0.5` is a
+  guess, not a tuned value. The generator's remaining weak points are the collar
+  (a simple band, where a real one has a fold and a stand) and the silhouette
+  (geometrically clean, where real drape gives wavy hems and bunching).
 
-- **Train on train2020.** 631 training images is very little. The full split is
-  ~45k; attaching it as a Kaggle input dataset avoids the 20GB download entirely.
+- **Back views, to unlock `back_body`.** The generator is the only realistic route
+  to it — Fashionpedia has no front/back label and photographs of worn garments
+  almost never show the back. Adding back-view samples would turn a guaranteed
+  zero into a real class. Left out for now because it means moving to a 5-class
+  label set and Fashionpedia body pixels would become noisy front labels.
+
+- **Train on train2020.** 631 real training images is very little. The full split
+  is ~45k; attaching it as a Kaggle input dataset avoids the 20GB download.
 - **A left/right accuracy number.** Panel targeting is 25% of the score and this
   repo still has no measurement of it. Fashionpedia does not label which sleeve
   is which, but it can be derived: for images whose ground truth has exactly two
@@ -439,6 +506,12 @@ Being specific, since the brief asks:
 - **Measurement:** the latency table, the parameter counts, the domain-gap probe,
   and the decision to ship flip TTA *disabled* pending a real measurement rather
   than assume it helps.
+- **The synthetic generator** (`src/synth.py`) was built this way too: I set the
+  direction (procedural renders, 4 classes, training-only mixing so validation
+  stays honest), and the fidelity was driven by looking at contact sheets and
+  fixing what was visibly wrong — the neck reading as a hole to the backdrop,
+  and sleeves detaching from the shoulder. Both fixes came from inspecting output,
+  not from theory, and both are now covered by tests.
 
 I have read everything in this repo and can walk through any of it. Where the
 numbers are uncertain or the approach is a known weak point, the README says so
